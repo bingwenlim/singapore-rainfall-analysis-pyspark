@@ -15,10 +15,21 @@ the cost of two features LightGBM had (handled below):
   - No monotone constraints   -> we enforce P(>X) non-increasing in X *post-hoc*
                                  at prediction time instead of during training.
 
-Local run on a sample (what we actually use):
-    JAVA_HOME=$PWD/.runtime/java-home uv run python scripts/train.py \
-        --input data/train_table --output models/run-001 \
-        --sample-frac 0.1 --num-iterations 50
+Runs the same either way — --input/--output take local paths or gs:// URIs.
+
+Local (what we've used; sample the train set to keep it quick):
+    JAVA_HOME=$PWD/.runtime/java-home \
+    PYSPARK_SUBMIT_ARGS="--driver-memory 12g pyspark-shell" \
+    uv run python scripts/train.py \
+        --input data/train_table --output models/run-local \
+        --sample-frac 0.1
+
+Cloud (Dataproc, full data — no extra packages/network setup; GBT is built-in):
+    gcloud dataproc jobs submit pyspark scripts/train.py \
+        --project=$PROJECT --region=$REGION --cluster=$CLUSTER \
+        -- \
+        --input gs://$BUCKET/data/train_table \
+        --output gs://$BUCKET/models/run-001
 """
 
 import argparse
@@ -27,10 +38,10 @@ import json
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
-# --- Defaults; override with the matching CLI flag ---------------------------
-BUCKET = "spark-rainfall-9486f2d0"
-INPUT = f"gs://{BUCKET}/data/train_table"      # threshold-expanded feature table (Parquet)
-OUTPUT = f"gs://{BUCKET}/models/run-001"        # model + metrics destination
+# --- Model hyperparameters (tuned; see scripts/tune.py) ----------------------
+# --input / --output are REQUIRED and location-agnostic: pass local paths to run
+# locally (e.g. data/train_table) or gs:// paths to run on Dataproc. Spark reads
+# both identically, and nothing else in this script is cloud-specific.
 TRAIN_MAX_YEAR = 2023                            # train on <= this year, test on the rest
 NUM_ITERATIONS = 60                              # GBT boosting iterations (maxIter); tuned
 MAX_DEPTH = 5                                    # tuned (depth 3 underfits, 7 overfits)
@@ -54,8 +65,10 @@ THRESHOLDS = [0.2, 1.0, 2.0, 5.0, 10.0]
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--input", default=INPUT)
-    p.add_argument("--output", default=OUTPUT)
+    p.add_argument("--input", required=True,
+                   help="Parquet feature table (local path or gs:// URI)")
+    p.add_argument("--output", required=True,
+                   help="where to write model + metrics (local path or gs:// URI)")
     p.add_argument("--train-max-year", type=int, default=TRAIN_MAX_YEAR)
     p.add_argument("--num-iterations", type=int, default=NUM_ITERATIONS)
     p.add_argument("--sample-frac", type=float, default=1.0,

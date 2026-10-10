@@ -136,7 +136,51 @@ JAVA_HOME=$PWD/.runtime/java-home PYSPARK_SUBMIT_ARGS="--driver-memory 12g pyspa
 - Writes `models/run-local/model` (fitted `PipelineModel`) and `models/run-local/metrics`
   (JSON: per-threshold pr_auc/roc_auc/f1/precision/recall + config).
 - `train.py` is pure MLlib, so the SAME script also runs on a Dataproc cluster if a
-  bigger run is ever wanted (no packages/NAT/barrier needed now).
+  bigger (e.g. full-data) run is wanted — see the recipe below.
+
+### Run on Dataproc (full data) — the GBT recipe
+
+Much simpler than the abandoned LightGBM path: no packages, no Cloud NAT, no barrier
+mode, no dynamic-allocation flags. GBT is built into Spark. GCP values are in
+`config.py` (PROJECT=`project-9486f2d0-6b86-4bff-891`, REGION=`asia-southeast1`,
+BUCKET=`spark-rainfall-9486f2d0`).
+
+1. **Upload the table** (once; may already be there from before):
+   ```
+   gsutil -m cp -r data/train_table gs://spark-rainfall-9486f2d0/data/train_table
+   ```
+2. **Create a cluster** — any x86 image works (no SynapseML, so the Scala-version /
+   arm64 constraints are gone). Autoscaling is fine for GBT (unlike barrier LightGBM).
+   Fixed example:
+   ```
+   gcloud dataproc clusters create rainfall-train \
+     --project=project-9486f2d0-6b86-4bff-891 --region=asia-southeast1 \
+     --master-machine-type=n4-standard-4 --master-boot-disk-type=hyperdisk-balanced \
+     --num-workers=4 --worker-machine-type=n4-standard-4 \
+     --worker-boot-disk-type=hyperdisk-balanced --image-version=2.3-debian12 \
+     --max-idle=30m --scopes=https://www.googleapis.com/auth/cloud-platform
+   ```
+   (First-time project setup needs: `gcloud services enable dataproc.googleapis.com`
+   and the compute service account granted `roles/dataproc.worker`.)
+3. **Smoke-test first** (1% — confirms GBT runs on the cluster, cheap):
+   ```
+   gcloud dataproc jobs submit pyspark scripts/train.py \
+     --project=project-9486f2d0-6b86-4bff-891 --region=asia-southeast1 --cluster=rainfall-train \
+     -- --input gs://spark-rainfall-9486f2d0/data/train_table \
+        --output gs://spark-rainfall-9486f2d0/models/smoke --sample-frac 0.01
+   ```
+4. **Full run** (drop `--sample-frac`):
+   ```
+   gcloud dataproc jobs submit pyspark scripts/train.py \
+     --project=project-9486f2d0-6b86-4bff-891 --region=asia-southeast1 --cluster=rainfall-train \
+     -- --input gs://spark-rainfall-9486f2d0/data/train_table \
+        --output gs://spark-rainfall-9486f2d0/models/run-001
+   ```
+5. **Download results and DELETE the cluster** (it bills while alive):
+   ```
+   gsutil -m cp -r gs://spark-rainfall-9486f2d0/models/run-001 ./models/run-001
+   gcloud dataproc clusters delete rainfall-train --region=asia-southeast1
+   ```
 
 Results on the 10% train sample (full 2024 test), per threshold — PR-AUC (primary),
 ROC-AUC, then F1/precision/recall at the 0.5 cutoff:
