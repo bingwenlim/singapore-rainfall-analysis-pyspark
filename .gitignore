@@ -16,3 +16,4 @@ config.py
 scratch/
 data/
 !data/.gitkeep
+models/
