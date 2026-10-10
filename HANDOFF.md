@@ -135,10 +135,21 @@ JAVA_HOME=$PWD/.runtime/java-home PYSPARK_SUBMIT_ARGS="--driver-memory 12g pyspa
 - `train.py` is pure MLlib, so the SAME script also runs on a Dataproc cluster if a
   bigger run is ever wanted (no packages/NAT/barrier needed now).
 
-Results on the 10% sample (full 2024 test), precision/recall/F1 at 0.5 cutoff:
-precision stays ~0.65–0.81, recall falls 0.56→0.19 as the threshold rises (rarer
-events harder), F1 0.66→0.29. Sensible and coherent. (PR-AUC/ROC-AUC added after;
-read `models/run-local/metrics` for the current numbers.)
+Results on the 10% train sample (full 2024 test), per threshold — PR-AUC (primary),
+ROC-AUC, then F1/precision/recall at the 0.5 cutoff:
+
+| threshold | PR-AUC | ROC-AUC | F1 | precision | recall |
+|---|---|---|---|---|---|
+| >0.2 mm | 0.75 | 0.95 | 0.66 | 0.82 | 0.56 |
+| >1 mm  | 0.67 | 0.95 | 0.59 | 0.79 | 0.47 |
+| >2 mm  | 0.59 | 0.95 | 0.52 | 0.74 | 0.40 |
+| >5 mm  | 0.47 | 0.96 | 0.38 | 0.73 | 0.25 |
+| >10 mm | 0.36 | 0.97 | 0.29 | 0.65 | 0.18 |
+
+PR-AUC far exceeds the positive base rate at every threshold (~4.6% at 0.2mm down to
+~0.4% at 10mm), so the model has real signal — strongest for common rain, declining
+(as expected) for rarer heavy events. The low recall at the 0.5 cutoff reflects a
+conservative operating point, tunable later. Full numbers in `models/run-local/metrics`.
 
 Open follow-ups (deferred, not blocking):
 - **Full-data run** (drop `--sample-frac`): memory doesn't scale 10× (Spark streams
