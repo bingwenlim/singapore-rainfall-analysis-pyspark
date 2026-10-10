@@ -23,7 +23,10 @@ Everything local runs on local Spark via `uv`. The notebook is the report;
 - `scripts/csv_to_parquet.py` — one-time CSV→Parquet conversion. Already run.
 - `scripts/train.py` — the training job: Spark MLlib `GBTClassifier`, runs locally
   (pure JVM, no cloud). Pivoted here from LightGBM/SynapseML — see "The LightGBM →
-  GBT pivot" below.
+  GBT pivot" below. Hyperparameters are tuned (see `tune.py`).
+- `scripts/tune.py` — hyperparameter tuning harness (local, 1% sample, validates on
+  2023 so the 2024 test year stays untouched). Found GBT insensitive here; best was
+  maxDepth 5 / maxIter 60 / stepSize 0.1 (all configs clustered ~0.681 val PR-AUC).
 - `src/spark_project/session.py` — `create_local_spark()` helper (bundled JDK, env).
 - `config.py` — real GCP values (**gitignored**). `config.example.py` is the template.
 - `data/` — **gitignored.** `data/parquet` (51 MB, source) and `data/train_table`

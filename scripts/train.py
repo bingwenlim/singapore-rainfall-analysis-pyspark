@@ -32,9 +32,9 @@ BUCKET = "spark-rainfall-9486f2d0"
 INPUT = f"gs://{BUCKET}/data/train_table"      # threshold-expanded feature table (Parquet)
 OUTPUT = f"gs://{BUCKET}/models/run-001"        # model + metrics destination
 TRAIN_MAX_YEAR = 2023                            # train on <= this year, test on the rest
-NUM_ITERATIONS = 50                              # GBT boosting iterations (maxIter)
-MAX_DEPTH = 5
-STEP_SIZE = 0.1                                  # GBT learning rate (shrinkage)
+NUM_ITERATIONS = 60                              # GBT boosting iterations (maxIter); tuned
+MAX_DEPTH = 5                                    # tuned (depth 3 underfits, 7 overfits)
+STEP_SIZE = 0.1                                  # GBT learning rate; tuned (0.05/0.1/0.2 tied)
 MAX_BINS = 128                                   # must be >= station cardinality (67) + buffer
 MISSING_SENTINEL = -1.0                          # fill value for missing features (rain >= 0,
                                                  # so -1 is an unambiguous "was missing" marker)
