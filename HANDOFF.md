@@ -9,7 +9,8 @@ Two deliverables over Singapore 5-minute rainfall data (91 stations, 2017–2024
 1. **Part 1 — EDA / weather patterns** (done, in the notebook).
 2. **Part 2 — ML model**: probability a station accumulates **> X mm in the next
    30 minutes**, given station + prediction time + threshold X. Data prep is done
-   in the notebook; **training runs on GCP Dataproc and has not been run yet.**
+   in the notebook; **the model (`train.py`) trains locally with Spark MLlib GBT —
+   a working run is done (10% sample). See the Part 2 sections below.**
 
 Everything local runs on local Spark via `uv`. The notebook is the report;
 `scripts/` holds the batch jobs.
@@ -20,8 +21,9 @@ Everything local runs on local Spark via `uv`. The notebook is the report;
   plots A–D) and Part 2 data prep (2.1 accumulation + threshold EDA, 2.2 feature
   table). Runs top-to-bottom on local Spark.
 - `scripts/csv_to_parquet.py` — one-time CSV→Parquet conversion. Already run.
-- `scripts/train.py` — the Dataproc training job (LightGBM via SynapseML). **Not
-  run yet.**
+- `scripts/train.py` — the training job: Spark MLlib `GBTClassifier`, runs locally
+  (pure JVM, no cloud). Pivoted here from LightGBM/SynapseML — see "The LightGBM →
+  GBT pivot" below.
 - `src/spark_project/session.py` — `create_local_spark()` helper (bundled JDK, env).
 - `config.py` — real GCP values (**gitignored**). `config.example.py` is the template.
 - `data/` — **gitignored.** `data/parquet` (51 MB, source) and `data/train_table`
@@ -63,114 +65,90 @@ Everything local runs on local Spark via `uv`. The notebook is the report;
    - island-wide spatial context at t: `isl_frac_wet, isl_mean, isl_max, isl_std,
      isl_n_stations`.
    - cyclical time: sin/cos of **minute-of-day** and day-of-year.
-   - `station_id` (categorical), `lat`, `lon`.
-   Missing values are kept as **NaN** (LightGBM handles them natively; a gap ≠ an
-   observed zero). Then each row is replicated over the 5 thresholds, label =
-   `accum30 > X`, written to `data/train_table` partitioned by year.
-3. `scripts/train.py` trains ONE LightGBM classifier with `threshold` as a feature
-   (so one model answers any X), chronological split, per-threshold evaluation.
+   - `station_id`, `lat`, `lon`.
+   Missing values are kept as **NaN** in the table (a gap ≠ an observed zero; the
+   table stays model-neutral). Then each row is replicated over the 5 thresholds,
+   label = `accum30 > X`, written to `data/train_table` partitioned by year.
+   (The notebook feature engineering is DONE and unchanged — the model pivot below
+   is all consumer-side in `train.py`.)
+3. `scripts/train.py` trains ONE classifier with `threshold` as a feature (so one
+   model answers any X), chronological split, per-threshold evaluation. **Now a
+   Spark MLlib `GBTClassifier`** (see the pivot below), run **locally**.
 
 ## Modelling decisions (settled, with reasons)
 
 - **Binary classifier, threshold as a feature** (not quantile regression; not
   one-model-per-threshold). The task wants P(exceed X) with X as an input.
-- **Monotone constraint** (−1) on the threshold feature so P(>X) is non-increasing
-  in X.
 - **Chronological split with a 30-min boundary gap**: train on
   `timestamp < 2024-01-01 − 30min`, test on `timestamp >= 2024-01-01`. The gap
   stops a training row's forward label window from peeking into the test period.
-  (Single held-out year 2024 — ample but coarse. Rolling-origin CV over several
-  years is a possible upgrade **if Dataproc cost is low**; noted in the script.)
-- **Evaluate per threshold**: PR-AUC (primary, heavy imbalance), ROC-AUC, F1.
-  Never accuracy, never a single aggregate across thresholds.
-- Known **local training limitation**: SynapseML's LightGBM native lib does not load
-  on Apple-Silicon macOS. The pipeline *shape* was validated locally with MLlib GBT
-  (PR-AUC ~0.75 at 0.2mm down to ~0.35 at 10mm on a 2% sample — sanity only). The
-  real LightGBM fit must run on Dataproc (Linux).
+  Single held-out year 2024 — ample but coarse; rolling-origin CV is a noted upgrade.
+- **Evaluate per threshold**: PR-AUC (primary, heavy imbalance), ROC-AUC, plus
+  F1/precision/recall at the 0.5 cutoff. Never accuracy, never one aggregate.
+- **Monotonicity** (P(>X) non-increasing in X): enforced **post-hoc** (running max
+  of the probability over descending threshold per station-time), since MLlib GBT
+  has no monotone constraint.
+- **Missing features → −1 sentinel** before the vector assembler (GBT has no native
+  NaN handling; rainfall ≥ 0 so −1 is an unambiguous "was missing" marker, distinct
+  from an observed 0 — preserving the gap-aware intent).
+- **`station_id` as a numeric index feature** (not a declared categorical): MLlib
+  loses per-slot categorical metadata through VectorAssembler, and lat/lon already
+  carry station geography. `maxBins=128` (must exceed the ~67 station cardinality).
 
-## What's left: run Part 2 on Dataproc (NOT done)
+## The LightGBM → GBT pivot (why, so nobody re-litigates it)
 
-GCP values are in `config.py`:
-- PROJECT = `project-9486f2d0-6b86-4bff-891`
-- REGION = `asia-southeast1`
-- BUCKET = `spark-rainfall-9486f2d0`
+The original plan was LightGBM via SynapseML on Dataproc. We **tried it on Dataproc
+and abandoned it** after peeling through this failure chain (each real, each fixed,
+until a wall):
 
-Steps (you drive the GCP CLI; `! <cmd>` in the Claude session runs it inline):
+1. Jar wouldn't download on internal-IP nodes → fixed with **Cloud NAT**.
+2. LightGBM driver↔worker **socket handshake failed** → fixed with
+   `useBarrierExecutionMode=True`.
+3. Barrier mode conflicts with Spark **dynamic allocation** → set
+   `spark.dynamicAllocation.enabled=false`.
+4. Single-node barrier run **OOM'd**; 4-worker run then hit a native **SIGSEGV** in
+   `lib_lightgbm` (confirmed via YARN container logs — not memory, not firewall).
 
-1. **Auth / config** (once):
-   ```
-   gcloud auth login
-   gcloud config set project project-9486f2d0-6b86-4bff-891
-   ```
-2. **Upload the training table** (1.1 GB):
-   ```
-   gsutil -m cp -r data/train_table gs://spark-rainfall-9486f2d0/data/train_table
-   ```
-3. **Create a Dataproc cluster — VM cluster, image 2.3-debian12, x86-64 nodes.**
-   Verified compatibility (two independent doc checks):
-   - Dataproc **VM cluster** image `2.3-debian12` = Spark 3.5.3 + **Scala 2.12.18**,
-     which matches `synapseml_2.12:1.1.3`. (Note: Dataproc **Serverless** 2.3 is
-     Scala 2.13 instead, which has NO matching SynapseML build — that's why we use a
-     VM cluster, not Serverless.)
-   - **Machine type must be x86-64** (e.g. `n4-standard-4`). SynapseML's LightGBM
-     native lib ships x86-64 binaries only — **no arm64**. ARM types (`c4a`,
-     Axion-class) fail with `UnsatisfiedLinkError` loading `lib_lightgbm.so`.
-   - `n4` requires `hyperdisk-balanced` boot disk (set below).
-   - External IP (or Cloud NAT) is needed so Ivy can fetch the SynapseML jar from
-     `mmlspark.blob.core.windows.net` (not on Maven Central). The command below uses
-     a default external IP; if an org policy forbids that, add Cloud NAT instead.
+The SIGSEGV is a native-library incompatibility (SynapseML 1.1.3 / lightgbmlib
+3.3.510 on Dataproc 2.3), not something our config could fix — and LightGBM's native
+lib won't load on Apple-Silicon locally either. So we **switched to MLlib
+`GBTClassifier`**: pure JVM (no native lib, no worker socket mesh), runs anywhere
+Spark runs. Slightly weaker than LightGBM, and it costs the two features handled
+above (sentinel for NaN, post-hoc for monotonicity), but it **actually runs and
+produces the deliverable**. All the Dataproc resources were deleted.
 
-   ```
-   gcloud dataproc clusters create rainfall-smoke \
-     --project=project-9486f2d0-6b86-4bff-891 \
-     --region=asia-southeast1 \
-     --single-node \
-     --master-machine-type=n4-standard-4 \
-     --master-boot-disk-type=hyperdisk-balanced \
-     --master-boot-disk-size=100 \
-     --image-version=2.3-debian12 \
-     --max-idle=30m \
-     --scopes=https://www.googleapis.com/auth/cloud-platform
-   ```
-   (`--max-idle` auto-deletes if left idle; still delete manually when done — step 5.
-   Optional belt-and-suspenders once up: `scala -version` on a node to confirm 2.12.)
+## How to run Part 2 (GBT, locally — DONE, reproducible)
 
-4. **Smoke-test first, then full run.** Submit the same job with a tiny sample before
-   the full 195M-row run — this is the only way to confirm LightGBM's native fit works
-   on the cluster (it can't be tested on Apple-Silicon locally). The `^#^` sets `#` as
-   the property delimiter so the two spark.jars.* values aren't split on their commas:
-   ```
-   # smoke test (seconds of compute):
-   gcloud dataproc jobs submit pyspark scripts/train.py \
-     --project=project-9486f2d0-6b86-4bff-891 --region=asia-southeast1 --cluster=rainfall-smoke \
-     --properties=^#^spark.jars.packages=com.microsoft.azure:synapseml_2.12:1.1.3#spark.jars.repositories=https://mmlspark.blob.core.windows.net/maven \
-     -- \
-     --input gs://spark-rainfall-9486f2d0/data/train_table \
-     --output gs://spark-rainfall-9486f2d0/models/smoke \
-     --sample-frac 0.01 --num-iterations 30
+No cloud needed. From the repo root:
 
-   # full run (same command, drop --sample-frac/--num-iterations, real output path):
-   #   --output gs://spark-rainfall-9486f2d0/models/run-001
-   ```
-   (Re-check the exact SynapseML coordinate/version at run time; versions drift.)
-5. **Download results and DELETE the cluster** (it bills while alive):
-   ```
-   gsutil -m cp -r gs://spark-rainfall-9486f2d0/models/run-001 ./models/run-001
-   gcloud dataproc clusters delete rainfall-smoke --region=asia-southeast1
-   ```
+```
+JAVA_HOME=$PWD/.runtime/java-home PYSPARK_SUBMIT_ARGS="--driver-memory 12g pyspark-shell" \
+  uv run python scripts/train.py \
+    --input data/train_table --output models/run-local \
+    --sample-frac 0.1 --num-iterations 40
+```
 
-`train.py` writes `run-001/model` (the fitted pipeline) and `run-001/metrics`
-(JSON report: per-threshold PR-AUC/ROC-AUC/F1/precision/recall + config).
+- `--sample-frac` samples **whole station-timestamp observations** of the TRAIN set
+  (all 5 thresholds kept together). The TEST set is always full 2024 (~28M rows).
+- Writes `models/run-local/model` (fitted `PipelineModel`) and `models/run-local/metrics`
+  (JSON: per-threshold pr_auc/roc_auc/f1/precision/recall + config).
+- `train.py` is pure MLlib, so the SAME script also runs on a Dataproc cluster if a
+  bigger run is ever wanted (no packages/NAT/barrier needed now).
 
-Open decisions for whoever runs it:
-- Use a **VM cluster, not Serverless** — Serverless 2.3 is Scala 2.13 with no
-  matching SynapseML build (see step 3).
-- `--num-iterations` / `learningRate` / `numLeaves` are defaults in `train.py`;
-  tune after a first baseline, not before.
-- Rolling-origin CV (vs the single 2024 test year) is a possible upgrade if the
-  Dataproc cost turns out low.
-- Calibration (Brier/reliability) and threshold-specific class weighting are
-  deliberately deferred until a baseline exists.
+Results on the 10% sample (full 2024 test), precision/recall/F1 at 0.5 cutoff:
+precision stays ~0.65–0.81, recall falls 0.56→0.19 as the threshold rises (rarer
+events harder), F1 0.66→0.29. Sensible and coherent. (PR-AUC/ROC-AUC added after;
+read `models/run-local/metrics` for the current numbers.)
+
+Open follow-ups (deferred, not blocking):
+- **Full-data run** (drop `--sample-frac`): memory doesn't scale 10× (Spark streams
+  partitions; eval is already full-2024 every run) — the fit just gets slower and
+  is the one OOM-risk. Step up gradually (25/50%) rather than jumping to 100%.
+- **Probability calibration** (Brier/reliability) — GBT probabilities are poorly
+  calibrated; worth adding for a probability-estimation task.
+- **0.5 cutoff is arbitrary** for rare events (drives low recall); tune the operating
+  point on a validation period, not the test year.
+- Rolling-origin CV instead of the single 2024 test year.
 
 ## Minor known loose ends (cosmetic, not blocking)
 
