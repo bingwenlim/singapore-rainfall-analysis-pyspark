@@ -106,36 +106,69 @@ Steps (you drive the GCP CLI; `! <cmd>` in the Claude session runs it inline):
    ```
    gsutil -m cp -r data/train_table gs://spark-rainfall-9486f2d0/data/train_table
    ```
-3. **Create a Dataproc cluster — MUST be Spark 3.5 / Scala 2.12** (SynapseML 1.1.3
-   has no Spark-3.5/Scala-2.13 build; mismatch → `LightGBMClassifier does not exist
-   in the JVM`). Verify the image's Scala version before relying on it. If the
-   cluster nodes are internal-IP-only, you need Cloud NAT so Ivy can fetch the
-   SynapseML jar from `mmlspark.blob.core.windows.net` (not on Maven Central).
-4. **Submit the job** (the `^#^` sets `#` as delimiter so the two spark.jars.*
-   properties aren't split on their internal commas):
+3. **Create a Dataproc cluster — VM cluster, image 2.3-debian12, x86-64 nodes.**
+   Verified compatibility (two independent doc checks):
+   - Dataproc **VM cluster** image `2.3-debian12` = Spark 3.5.3 + **Scala 2.12.18**,
+     which matches `synapseml_2.12:1.1.3`. (Note: Dataproc **Serverless** 2.3 is
+     Scala 2.13 instead, which has NO matching SynapseML build — that's why we use a
+     VM cluster, not Serverless.)
+   - **Machine type must be x86-64** (e.g. `n4-standard-4`). SynapseML's LightGBM
+     native lib ships x86-64 binaries only — **no arm64**. ARM types (`c4a`,
+     Axion-class) fail with `UnsatisfiedLinkError` loading `lib_lightgbm.so`.
+   - `n4` requires `hyperdisk-balanced` boot disk (set below).
+   - External IP (or Cloud NAT) is needed so Ivy can fetch the SynapseML jar from
+     `mmlspark.blob.core.windows.net` (not on Maven Central). The command below uses
+     a default external IP; if an org policy forbids that, add Cloud NAT instead.
+
    ```
+   gcloud dataproc clusters create rainfall-smoke \
+     --project=project-9486f2d0-6b86-4bff-891 \
+     --region=asia-southeast1 \
+     --single-node \
+     --master-machine-type=n4-standard-4 \
+     --master-boot-disk-type=hyperdisk-balanced \
+     --master-boot-disk-size=100 \
+     --image-version=2.3-debian12 \
+     --max-idle=30m \
+     --scopes=https://www.googleapis.com/auth/cloud-platform
+   ```
+   (`--max-idle` auto-deletes if left idle; still delete manually when done — step 5.
+   Optional belt-and-suspenders once up: `scala -version` on a node to confirm 2.12.)
+
+4. **Smoke-test first, then full run.** Submit the same job with a tiny sample before
+   the full 195M-row run — this is the only way to confirm LightGBM's native fit works
+   on the cluster (it can't be tested on Apple-Silicon locally). The `^#^` sets `#` as
+   the property delimiter so the two spark.jars.* values aren't split on their commas:
+   ```
+   # smoke test (seconds of compute):
    gcloud dataproc jobs submit pyspark scripts/train.py \
-     --project=project-9486f2d0-6b86-4bff-891 --region=asia-southeast1 --cluster=$CLUSTER \
+     --project=project-9486f2d0-6b86-4bff-891 --region=asia-southeast1 --cluster=rainfall-smoke \
      --properties=^#^spark.jars.packages=com.microsoft.azure:synapseml_2.12:1.1.3#spark.jars.repositories=https://mmlspark.blob.core.windows.net/maven \
      -- \
      --input gs://spark-rainfall-9486f2d0/data/train_table \
-     --output gs://spark-rainfall-9486f2d0/models/run-001
+     --output gs://spark-rainfall-9486f2d0/models/smoke \
+     --sample-frac 0.01 --num-iterations 30
+
+   # full run (same command, drop --sample-frac/--num-iterations, real output path):
+   #   --output gs://spark-rainfall-9486f2d0/models/run-001
    ```
    (Re-check the exact SynapseML coordinate/version at run time; versions drift.)
 5. **Download results and DELETE the cluster** (it bills while alive):
    ```
    gsutil -m cp -r gs://spark-rainfall-9486f2d0/models/run-001 ./models/run-001
-   gcloud dataproc clusters delete $CLUSTER --region=asia-southeast1
+   gcloud dataproc clusters delete rainfall-smoke --region=asia-southeast1
    ```
 
 `train.py` writes `run-001/model` (the fitted pipeline) and `run-001/metrics`
 (JSON report: per-threshold PR-AUC/ROC-AUC/F1/precision/recall + config).
 
 Open decisions for whoever runs it:
-- Dataproc **cluster** (Compute Engine) is the lower-risk path over Serverless for
-  the SynapseML Scala-version reason above.
+- Use a **VM cluster, not Serverless** — Serverless 2.3 is Scala 2.13 with no
+  matching SynapseML build (see step 3).
 - `--num-iterations` / `learningRate` / `numLeaves` are defaults in `train.py`;
   tune after a first baseline, not before.
+- Rolling-origin CV (vs the single 2024 test year) is a possible upgrade if the
+  Dataproc cost turns out low.
 - Calibration (Brier/reliability) and threshold-specific class weighting are
   deliberately deferred until a baseline exists.
 
