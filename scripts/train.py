@@ -1,25 +1,35 @@
-"""Train the 30-minute rainfall-exceedance model on Dataproc (batch job).
+"""Train the 30-minute rainfall-exceedance model (Spark MLlib GBTClassifier).
 
 Reads the threshold-expanded feature table built by the notebook (Part 2.2),
-trains one LightGBM classifier that takes the threshold as a feature, and writes
-the fitted pipeline plus a per-threshold metrics report.
+trains one gradient-boosted-tree classifier that takes the threshold as a
+feature, and writes the fitted pipeline plus a per-threshold metrics report.
 
-This is a self-contained PySpark script that runs ON the cluster. It does not
-import config.py (that file isn't shipped to the cluster) — pass paths via flags.
+Self-contained PySpark script — pass paths via flags. Runs on plain Spark MLlib
+(no third-party packages), so it works on local Spark or Dataproc unchanged.
 
-LightGBM comes from SynapseML, loaded as a job package. Match the Scala suffix to
-the cluster's Spark/Scala build (2.12 for a Spark 3.5 image), and use the SynapseML
-build documented for that Spark version (1.1.3 for Spark 3.5). Example submit:
+Why GBT and not LightGBM: SynapseML's LightGBM native library segfaults on this
+environment (and won't load on Apple-Silicon locally at all). MLlib GBT is pure
+JVM — no native lib, no worker socket mesh — so it runs anywhere Spark runs, at
+the cost of two features LightGBM had (handled below):
+  - No native NaN handling   -> we fill missing features with a -1 sentinel.
+  - No monotone constraints   -> we enforce P(>X) non-increasing in X *post-hoc*
+                                 at prediction time instead of during training.
 
+Runs the same either way — --input/--output take local paths or gs:// URIs.
+
+Local (what we've used; sample the train set to keep it quick):
+    JAVA_HOME=$PWD/.runtime/java-home \
+    PYSPARK_SUBMIT_ARGS="--driver-memory 12g pyspark-shell" \
+    uv run python scripts/train.py \
+        --input data/train_table --output models/run-local \
+        --sample-frac 0.1
+
+Cloud (Dataproc, full data — no extra packages/network setup; GBT is built-in):
     gcloud dataproc jobs submit pyspark scripts/train.py \
         --project=$PROJECT --region=$REGION --cluster=$CLUSTER \
-        --properties=^#^spark.jars.packages=com.microsoft.azure:synapseml_2.12:1.1.3#spark.jars.repositories=https://mmlspark.blob.core.windows.net/maven \
         -- \
         --input gs://$BUCKET/data/train_table \
         --output gs://$BUCKET/models/run-001
-
-(The ^#^ sets # as the delimiter so the two spark.jars.* properties can be passed
-together without the commas inside them being split.)
 """
 
 import argparse
@@ -28,15 +38,17 @@ import json
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
-# --- Defaults; override with the matching CLI flag ---------------------------
-BUCKET = "spark-rainfall-9486f2d0"
-INPUT = f"gs://{BUCKET}/data/train_table"      # threshold-expanded feature table (Parquet)
-OUTPUT = f"gs://{BUCKET}/models/run-001"        # model + metrics destination
+# --- Model hyperparameters (tuned; see scripts/tune.py) ----------------------
+# --input / --output are REQUIRED and location-agnostic: pass local paths to run
+# locally (e.g. data/train_table) or gs:// paths to run on Dataproc. Spark reads
+# both identically, and nothing else in this script is cloud-specific.
 TRAIN_MAX_YEAR = 2023                            # train on <= this year, test on the rest
-NUM_ITERATIONS = 200
-LEARNING_RATE = 0.05
-NUM_LEAVES = 63
-MONOTONE_THRESHOLD = True   # enforce P(exceed) non-increasing in the threshold feature
+NUM_ITERATIONS = 60                              # GBT boosting iterations (maxIter); tuned
+MAX_DEPTH = 5                                    # tuned (depth 3 underfits, 7 overfits)
+STEP_SIZE = 0.1                                  # GBT learning rate; tuned (0.05/0.1/0.2 tied)
+MAX_BINS = 128                                   # must be >= station cardinality (67) + buffer
+MISSING_SENTINEL = -1.0                          # fill value for missing features (rain >= 0,
+                                                 # so -1 is an unambiguous "was missing" marker)
 # -----------------------------------------------------------------------------
 
 # Must match the notebook's MODEL_FEATURES (FEATURES + "threshold").
@@ -53,8 +65,10 @@ THRESHOLDS = [0.2, 1.0, 2.0, 5.0, 10.0]
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--input", default=INPUT)
-    p.add_argument("--output", default=OUTPUT)
+    p.add_argument("--input", required=True,
+                   help="Parquet feature table (local path or gs:// URI)")
+    p.add_argument("--output", required=True,
+                   help="where to write model + metrics (local path or gs:// URI)")
     p.add_argument("--train-max-year", type=int, default=TRAIN_MAX_YEAR)
     p.add_argument("--num-iterations", type=int, default=NUM_ITERATIONS)
     p.add_argument("--sample-frac", type=float, default=1.0,
@@ -66,11 +80,12 @@ def main():
 
     from datetime import datetime, timedelta
 
-    from pyspark import StorageLevel
     from pyspark.ml import Pipeline
     from pyspark.ml.feature import StringIndexer, VectorAssembler
+    from pyspark.ml.classification import GBTClassifier
     from pyspark.ml.evaluation import BinaryClassificationEvaluator
-    from synapse.ml.lightgbm import LightGBMClassifier
+    from pyspark.ml.linalg import VectorUDT, Vectors
+    from pyspark.sql.window import Window
 
     df = spark.read.parquet(args.input)
 
@@ -85,8 +100,8 @@ def main():
     # A row's label depends on rainfall up to t+30min, so the last training row at the
     # year boundary would otherwise peek into the test period. Hold out a 30-minute gap:
     # train on t < (cutoff − 30min), test on t >= cutoff. (A single held-out year is a
-    # coarse-but-ample test — millions of rows, all seasons. If Dataproc cost allows,
-    # rolling-origin CV over several years would give a cross-year variance estimate.)
+    # coarse-but-ample test — millions of rows, all seasons. Rolling-origin CV over
+    # several years would give a cross-year variance estimate if desired.)
     cutoff = datetime(args.train_max_year + 1, 1, 1)
     train_end = cutoff - timedelta(minutes=30)
     train = df.filter(F.col("timestamp") < F.lit(train_end))
@@ -98,52 +113,63 @@ def main():
                 .sample(False, args.sample_frac, seed=42))
         train = train.join(keys, ["station_id", "timestamp"], "left_semi")
 
-    n_train, n_test = train.count(), test.count()
-    print(f"train rows: {n_train:,}   test rows: {n_test:,}")
-    if n_train == 0 or n_test == 0:
+    # Cheap emptiness guard (take(1) short-circuits instead of counting ~195M rows).
+    if not train.take(1) or not test.take(1):
         raise ValueError("train or test split is empty — check --train-max-year and the data range")
 
-    # station_id -> numeric index, declared categorical to LightGBM by slot INDEX (0),
-    # which doesn't depend on the assembler preserving the column name in metadata.
-    # handleInvalid="keep" buckets unseen stations rather than erroring (they then lean
-    # on lat/lon and the other features).
+    # GBT has no native NaN handling, so fill the missing features (gap-aware lags and
+    # isl_std) with a -1 sentinel. Rainfall is always >= 0, so -1 stays an unambiguous
+    # "was missing" marker, distinct from an observed zero — preserving the point of the
+    # gap-aware design that filling with 0 would destroy.
+    FILL = {c: MISSING_SENTINEL for c in ["rain_t5", "rain_t10", "rain_t15", "rain_t20", "isl_std"]}
+    train = train.fillna(FILL)
+    test = test.fillna(FILL)
+
+    # station_id -> numeric index. Treated as an ordinary numeric feature here (not a
+    # declared categorical): MLlib loses per-slot categorical metadata through the
+    # VectorAssembler, and lat/lon already carry station geography. handleInvalid="keep"
+    # buckets unseen stations instead of erroring.
     indexer = StringIndexer(inputCol=CATEGORICAL, outputCol="station_idx", handleInvalid="keep")
     assembler = VectorAssembler(
         inputCols=["station_idx"] + NUMERIC_FEATURES,
         outputCol="features",
-        handleInvalid="keep",   # pass NaN lags/isl_std through to LightGBM's native missing handling
+        handleInvalid="keep",
+    )
+    # maxBins must be >= the station cardinality (~67); the default 32 would error.
+    gbt = GBTClassifier(featuresCol="features", labelCol="label", maxIter=args.num_iterations,
+                        maxDepth=MAX_DEPTH, maxBins=MAX_BINS, stepSize=STEP_SIZE)
+
+    print(">>> fitting GBT pipeline...", flush=True)
+    model = Pipeline(stages=[indexer, assembler, gbt]).fit(train)
+    print(">>> fit done; scoring test set...", flush=True)
+
+    # Extract P(label=1) from the probability vector.
+    prob1 = F.udf(lambda v: float(v[1]), "double")
+    scored = model.transform(test).select(
+        "station_id", "timestamp", "threshold", "label",
+        prob1("probability").alias("p"),
     )
 
-    lgbm_kwargs = dict(
-        featuresCol="features",
-        labelCol="label",
-        objective="binary",
-        numIterations=args.num_iterations,
-        learningRate=LEARNING_RATE,
-        numLeaves=NUM_LEAVES,
-        categoricalSlotIndexes=[0],         # station_idx is slot 0 of the assembled vector
-        dataTransferMode="streaming",       # lower memory for the Spark->native handoff
-    )
-    if MONOTONE_THRESHOLD:
-        # One entry per assembled feature; -1 on `threshold` forces P(exceed) to be
-        # non-increasing as the threshold rises (P(>2) <= P(>1)), the rest unconstrained.
-        cols = ["station_idx"] + NUMERIC_FEATURES
-        lgbm_kwargs["monotoneConstraints"] = [-1 if c == "threshold" else 0 for c in cols]
+    # Post-hoc monotonicity: for one (station, timestamp), P(>X) must not increase with X.
+    # GBT can't enforce this at train time, so take a running max of p over DESCENDING
+    # threshold within each observation — i.e. P(>X) >= P(>any larger threshold). This
+    # monotonized probability (p_mono) is the model's final probability output; the hard
+    # prediction thresholds it at 0.5.
+    w = (Window.partitionBy("station_id", "timestamp")
+         .orderBy(F.desc("threshold"))
+         .rowsBetween(Window.unboundedPreceding, Window.currentRow))
+    to_vec = F.udf(lambda p: Vectors.dense([1.0 - p, p]), VectorUDT())
+    pred = (scored
+            .withColumn("p_mono", F.max("p").over(w))
+            .withColumn("prediction", (F.col("p_mono") >= 0.5).cast("int"))
+            .withColumn("prob_vec", to_vec("p_mono"))
+            .select("threshold", "label", "prediction", "prob_vec")
+            .persist())
 
-    lgbm = LightGBMClassifier(**lgbm_kwargs)
-    model = Pipeline(stages=[indexer, assembler, lgbm]).fit(train)
-
-    pred = (model.transform(test).select("threshold", "label", "probability", "prediction")
-            .persist(StorageLevel.MEMORY_AND_DISK))
-
-    # Per-threshold confusion counts in ONE aggregation (the class balance differs a lot
-    # across thresholds, so an aggregate number would mislead). PR-AUC/ROC-AUC still need
-    # a per-subset evaluator pass. ROC/PR-AUC are undefined when a subset is single-class.
-    pr_eval = BinaryClassificationEvaluator(labelCol="label", rawPredictionCol="probability",
-                                            metricName="areaUnderPR")
-    roc_eval = BinaryClassificationEvaluator(labelCol="label", rawPredictionCol="probability",
-                                             metricName="areaUnderROC")
-    conf = (
+    # Confusion counts for all thresholds in ONE aggregation (class balance differs a lot
+    # across thresholds, so a single aggregate would mislead).
+    print(">>> computing per-threshold metrics...", flush=True)
+    conf = {r["threshold"]: r for r in (
         pred.groupBy("threshold").agg(
             F.count("*").alias("n_test"),
             F.sum((F.col("label") == 1).cast("long")).alias("positives"),
@@ -151,40 +177,52 @@ def main():
             F.sum(((F.col("prediction") == 1) & (F.col("label") == 0)).cast("long")).alias("fp"),
             F.sum(((F.col("prediction") == 0) & (F.col("label") == 1)).cast("long")).alias("fn"),
         ).collect()
-    )
+    )}
+
+    # PR-AUC (primary, under heavy imbalance) and ROC-AUC per threshold, on the predicted
+    # probability. Undefined when a threshold's test slice is single-class -> report None.
+    pr_eval = BinaryClassificationEvaluator(labelCol="label", rawPredictionCol="prob_vec",
+                                            metricName="areaUnderPR")
+    roc_eval = BinaryClassificationEvaluator(labelCol="label", rawPredictionCol="prob_vec",
+                                             metricName="areaUnderROC")
 
     report = {"train_max_year": args.train_max_year, "num_iterations": args.num_iterations,
-              "n_train": n_train, "n_test": n_test, "per_threshold": []}
-    for row in sorted(conf, key=lambda r: r["threshold"]):
-        x = float(row["threshold"])
+              "per_threshold": []}
+    for x in sorted(conf):
+        row = conf[x]
         tp, fp, fn = row["tp"], row["fp"], row["fn"]
         positives, negatives = row["positives"], row["n_test"] - row["positives"]
         precision = tp / (tp + fp) if tp + fp else 0.0
         recall = tp / (tp + fn) if tp + fn else 0.0
         f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-        both_classes = positives > 0 and negatives > 0  # AUC undefined otherwise
-        sub = pred.filter(F.col("threshold") == x) if both_classes else None
+        both = positives > 0 and negatives > 0
+        sub = pred.filter(F.col("threshold") == x) if both else None
         report["per_threshold"].append({
-            "threshold": x,
+            "threshold": float(x),
             "n_test": row["n_test"],
             "positives": positives,
-            "pr_auc": pr_eval.evaluate(sub) if both_classes else None,
-            "roc_auc": roc_eval.evaluate(sub) if both_classes else None,
+            "pr_auc": pr_eval.evaluate(sub) if both else None,
+            "roc_auc": roc_eval.evaluate(sub) if both else None,
             "f1": f1, "precision": precision, "recall": recall,
         })
+    pred.unpersist()
 
     config = {
+        "model": "pyspark.ml GBTClassifier",
         "model_features": ["station_idx"] + NUMERIC_FEATURES,
-        "categorical_slot": 0,
+        "missing_sentinel": MISSING_SENTINEL,
         "thresholds": THRESHOLDS,
-        "monotone_threshold": MONOTONE_THRESHOLD,
-        "synapseml": "see submit --properties (synapseml_2.12:1.1.3)",
+        "monotonicity": "enforced post-hoc (running max of P over descending threshold)",
+        "max_bins": MAX_BINS, "max_depth": MAX_DEPTH, "step_size": STEP_SIZE,
+        "primary_metric": "pr_auc",
+        "deferred": "probability calibration (Brier/reliability); full-data (unsampled) run",
     }
     print(json.dumps({"report": report, "config": config}, indent=2))
+    print(">>> saving model + metrics to", args.output, flush=True)
     model.write().overwrite().save(args.output + "/model")
     (spark.createDataFrame([(json.dumps({"report": report, "config": config}),)], ["report"])
      .coalesce(1).write.mode("overwrite").text(args.output + "/metrics"))
-    pred.unpersist()
+    print(">>> done.", flush=True)
     spark.stop()
 
 
