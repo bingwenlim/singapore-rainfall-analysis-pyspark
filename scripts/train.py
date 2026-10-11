@@ -18,11 +18,13 @@ the cost of two features LightGBM had (handled below):
 Runs the same either way — --input/--output take local paths or gs:// URIs.
 
 Local (what we've used; sample the train set to keep it quick):
-    JAVA_HOME=$PWD/.runtime/java-home \
     PYSPARK_SUBMIT_ARGS="--driver-memory 12g pyspark-shell" \
     uv run python scripts/train.py \
         --input data/train_table --output models/run-local \
         --sample-frac 0.1
+
+    (Needs a JDK 11: either installed system-wide with JAVA_HOME set, or extracted
+    project-locally to .runtime/java-home — this script auto-detects the latter.)
 
 Cloud (Dataproc, full data — no extra packages/network setup; GBT is built-in):
     gcloud dataproc jobs submit pyspark scripts/train.py \
@@ -34,6 +36,8 @@ Cloud (Dataproc, full data — no extra packages/network setup; GBT is built-in)
 
 import argparse
 import json
+import os
+from pathlib import Path
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
@@ -74,6 +78,15 @@ def main():
     p.add_argument("--sample-frac", type=float, default=1.0,
                    help="Fraction of TRAIN rows to sample (for a quick local smoke test).")
     args = p.parse_args()
+
+    # If no JAVA_HOME is set but the project-local JDK exists (.runtime/java-home,
+    # created by extracting a Temurin 11 build there), use it — so the run command is
+    # the same whether Java is installed system-wide or project-locally. On Dataproc
+    # JAVA_HOME is already set, so this is a no-op there. Mirrors spark_project.session.
+    if "JAVA_HOME" not in os.environ:
+        bundled = Path(__file__).resolve().parents[1] / ".runtime" / "java-home"
+        if (bundled / "bin/java").exists():
+            os.environ["JAVA_HOME"] = str(bundled)
 
     spark = SparkSession.builder.appName("rainfall-30min-exceedance").getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
