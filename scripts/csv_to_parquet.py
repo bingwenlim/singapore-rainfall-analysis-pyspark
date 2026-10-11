@@ -38,9 +38,10 @@ SCHEMA = """
 
 def main():
     # local[*] uses all cores — fine for a one-off batch conversion.
-    # The CSV timestamps carry an explicit +08:00 offset (Singapore local time).
-    # Parsing with the session set to Asia/Singapore stores them as SGT wall-clock,
-    # so date/hour/month read back as local time with no manual +8 anywhere.
+    # The CSV timestamps carry an explicit +08:00 offset (Singapore local time). Spark
+    # stores a TIMESTAMP as a single UTC instant; reading it back under a session set to
+    # Asia/Singapore renders it as Singapore local time, so date/hour/month come out as
+    # local time with no manual +8. (Keep the analysis session on Asia/Singapore to match.)
     spark = create_local_spark(
         app_name="csv-to-parquet",
         master="local[*]",

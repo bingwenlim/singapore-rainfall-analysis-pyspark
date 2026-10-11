@@ -90,8 +90,15 @@ def main():
 
     spark = SparkSession.builder.appName("rainfall-30min-exceedance").getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
+    # Pin the session timezone so timestamps render consistently (SGT locally, UTC on
+    # Dataproc otherwise). Note this alone does NOT fix the year-boundary cutoff below:
+    # a naive Python datetime passed to F.lit() is converted using the *driver process's*
+    # local timezone before the session setting applies, so the cutoff must also be made
+    # timezone-aware (see below). The two together make the split the same instant anywhere.
+    spark.conf.set("spark.sql.session.timeZone", "Asia/Singapore")
 
     from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
 
     from pyspark.ml import Pipeline
     from pyspark.ml.feature import StringIndexer, VectorAssembler
@@ -115,7 +122,12 @@ def main():
     # train on t < (cutoff − 30min), test on t >= cutoff. (A single held-out year is a
     # coarse-but-ample test — millions of rows, all seasons. Rolling-origin CV over
     # several years would give a cross-year variance estimate if desired.)
-    cutoff = datetime(args.train_max_year + 1, 1, 1)
+    # Timezone-aware cutoff: an aware datetime carries its own offset, so F.lit() converts
+    # it to the same instant regardless of the driver process's local timezone (a naive
+    # datetime would be read in the process tz — SGT locally, UTC on Dataproc — shifting the
+    # boundary 8 hours between environments). Combined with the session tz above, both
+    # environments split 2024 at the same Singapore calendar-year boundary.
+    cutoff = datetime(args.train_max_year + 1, 1, 1, tzinfo=ZoneInfo("Asia/Singapore"))
     train_end = cutoff - timedelta(minutes=30)
     train = df.filter(F.col("timestamp") < F.lit(train_end))
     test = df.filter(F.col("timestamp") >= F.lit(cutoff))

@@ -51,8 +51,10 @@ def main():
 
     spark = SparkSession.builder.appName("rainfall-gbt-tune").getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
+    spark.conf.set("spark.sql.session.timeZone", "Asia/Singapore")
 
     from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
     from pyspark.ml import Pipeline
     from pyspark.ml.feature import StringIndexer, VectorAssembler
     from pyspark.ml.classification import GBTClassifier
@@ -64,8 +66,9 @@ def main():
 
     # Split WITHIN the training years: fit < (val_year − 30min gap), validate on val_year.
     # 2024 is never referenced here.
-    val_start = datetime(TUNE_TRAIN_MAX_YEAR + 1, 1, 1)
-    val_end = datetime(TUNE_TRAIN_MAX_YEAR + 2, 1, 1)
+    # Explicit SGT boundaries keep validation independent of the Python host timezone.
+    val_start = datetime(TUNE_TRAIN_MAX_YEAR + 1, 1, 1, tzinfo=ZoneInfo("Asia/Singapore"))
+    val_end = datetime(TUNE_TRAIN_MAX_YEAR + 2, 1, 1, tzinfo=ZoneInfo("Asia/Singapore"))
     fit_end = val_start - timedelta(minutes=30)
     tr = df.filter(F.col("timestamp") < F.lit(fit_end))
     va = df.filter((F.col("timestamp") >= F.lit(val_start)) & (F.col("timestamp") < F.lit(val_end)))
