@@ -30,11 +30,11 @@ uv run python scripts/csv_to_parquet.py
 
 ## Part 1 — EDA notebook
 
+Launch JupyterLab, then open `rainfall_eda.ipynb` and run it top to bottom (local Spark):
+
 ```
 uv run jupyter lab notebooks
 ```
-
-Open `rainfall_eda.ipynb` and run top to bottom (local Spark).
 
 ## Part 2 — train the model
 
@@ -55,8 +55,34 @@ uv run python scripts/train.py \
 Writes `models/run-local/model` (fitted `PipelineModel`) and `models/run-local/metrics`
 (per-threshold PR-AUC / ROC-AUC / F1 / precision / recall).
 
-**On Dataproc** (full data; no extra packages or network setup — GBT is built in):
-see the "Run on Dataproc" recipe in [HANDOFF.md](HANDOFF.md).
+**On Dataproc** (full data; no extra packages or network setup — GBT is built in).
+Create a cluster, submit the job, then download results and delete the cluster:
+
+```
+# 1. upload the feature table (once)
+gsutil -m cp -r data/train_table gs://$BUCKET/data/train_table
+
+# 2. create a cluster (fixed 4 workers; any x86 image is fine)
+gcloud dataproc clusters create rainfall-train \
+    --project=$PROJECT --region=$REGION \
+    --master-machine-type=n4-standard-4 --master-boot-disk-type=hyperdisk-balanced \
+    --num-workers=4 --worker-machine-type=n4-standard-4 \
+    --worker-boot-disk-type=hyperdisk-balanced --image-version=2.3-debian12 \
+    --max-idle=30m --scopes=https://www.googleapis.com/auth/cloud-platform
+
+# 3. submit the full-data run (drop --sample-frac to use all rows)
+gcloud dataproc jobs submit pyspark scripts/train.py \
+    --project=$PROJECT --region=$REGION --cluster=rainfall-train \
+    -- --input gs://$BUCKET/data/train_table --output gs://$BUCKET/models/run-001
+
+# 4. download results and DELETE the cluster (it bills while alive)
+gsutil -m cp -r gs://$BUCKET/models/run-001 ./models/run-001
+gcloud dataproc clusters delete rainfall-train --region=$REGION
+```
+
+First-time project setup (once): `gcloud services enable dataproc.googleapis.com`
+and grant the compute service account `roles/dataproc.worker`. `PROJECT`, `REGION`,
+`BUCKET` are in `config.py`. See [HANDOFF.md](HANDOFF.md) for the full recipe and notes.
 
 Hyperparameters are tuned via `scripts/tune.py` (local, validates on 2023 so the
 2024 test year is never used for model selection).
