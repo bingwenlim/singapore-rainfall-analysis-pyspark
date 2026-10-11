@@ -17,3 +17,4 @@ scratch/
 data/
 !data/.gitkeep
 models/
+archive/
