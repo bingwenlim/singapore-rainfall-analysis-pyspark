@@ -49,6 +49,15 @@ nohup env PYSPARK_SUBMIT_ARGS="--master local[8] --driver-memory 12g pyspark-she
     --sample-frac 0.1 --num-iterations 40 > train.log 2>&1 &
 ```
 
-## 5. Limitation
+## 5.Evaluation
+
+```bash
+PYSPARK_SUBMIT_ARGS="--master local[4] --driver-memory 4g pyspark-shell" \
+  uv run python scripts/predict.py batch --input data/train_table
+```
+
+
+
+## 6. Limitation
 
 Full-data training on the login node gets killed by the system.
