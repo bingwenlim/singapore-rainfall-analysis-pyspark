@@ -24,13 +24,11 @@ uv sync
 uv run python scripts/csv_to_parquet.py
 ```
 
-This writes `data/parquet/` (partitioned by year); your original CSVs are left untouched.
-
-**Times are interpreted in Singapore time (SGT).** Conversion to Parquet preserves each observation’s moment: `08:00+08:00` in the CSV represents `00:00 UTC` and displays as `08:00` when read in SGT. The notebook and scripts configure Singapore time for analysis and prediction; training and validation cutoffs also explicitly specify SGT.
+This writes `data/parquet/` (partitioned by year); your original CSVs are left untouched. All timestamps are handled in Singapore time (SGT).
 
 ## Part 1 — EDA notebook
 
-Open `notebooks/rainfall_eda.ipynb` in any Jupyter frontend (VS Code, JupyterLab, …) and run it top to bottom (local Spark). The notebook covers both Part 1 (the EDA) and Part 2's data preparation — running it through also writes the model's feature table to `data/train_table`. Use the project's `uv` virtualenv (`.venv`) as the kernel so PySpark (and your JDK 11) are picked up. For example, to launch JupyterLab:
+Open `notebooks/rainfall_eda.ipynb` in any Jupyter frontend and run it top to bottom (local Spark). It covers Part 1 (the EDA) and Part 2's data preparation — running it through also writes the model's feature table to `data/train_table`. Use the project's `uv` virtualenv (`.venv`) as the kernel. To launch JupyterLab:
 
 ```
 uv run jupyter lab notebooks
@@ -49,7 +47,9 @@ uv run python scripts/train.py \
     --sample-frac 0.1 --num-iterations 40
 ```
 
-(The tuned default is 60 iterations, as used for the full run; `--num-iterations 40` reproduces the saved 10%-sample baseline.) Writes `models/run-local/model` (fitted `PipelineModel`) and `models/run-local/metrics` (per-threshold PR-AUC / ROC-AUC / F1 / precision / recall).
+The default is 60 iterations (used for the full run); `--num-iterations 40` reproduces the saved 10%-sample baseline. Writes `models/run-local/model` (fitted `PipelineModel`) and `models/run-local/metrics` (per-threshold PR-AUC / ROC-AUC / F1 / precision / recall).
+
+`--output` is required and has no default. Each run should use a **fresh** output directory: the model is saved in overwrite mode, so pointing `--output` at an existing run (e.g. `models/run-001`) **replaces** that model. To train a new model while keeping the shipped `models/run-001`, give it a new name such as `--output models/run-002`.
 
 **On Dataproc** (full data; no extra packages or network setup — GBT is built in). Create a cluster, submit the job, then download results and delete the cluster:
 
@@ -81,26 +81,27 @@ Hyperparameters are tuned via `scripts/tune.py` (local, validates on 2023 so the
 
 ## Using the trained model
 
-`scripts/predict.py` scores the saved model. It has two modes.
+`scripts/predict.py` scores the saved model. It has two modes. Both default to the shipped model at `models/run-001/model`; pass `--model path/to/model` to score a different one (e.g. a model you trained yourself with `train.py`):
 
-**Single prediction** — the task's stated interface: give a station, a prediction time, and a threshold, and get the exceedance probability. The script derives that row's features (recent lags, island-wide context at the time, cyclical time, location) from the cleaned rainfall data internally, so you only pass the three inputs:
+```
+uv run python scripts/predict.py single --model models/run-002/model \
+    --station S08 --time "2021-06-01 15:00:00" --threshold 5
+```
+
+**Single prediction** — the task's interface: give a station, time, and threshold, get the exceedance probability. Features are derived from the rainfall data internally, so you only pass the three inputs:
 
 ```
 uv run python scripts/predict.py single --station S08 --time "2021-06-01 15:00:00" --threshold 5
 # -> P(station S08 accumulates > 5.0 mm in the 30 min after 2021-06-01 15:00:00) = ...
 ```
 
-(The time must be an on-grid 5-minute timestamp, in Singapore time, present in `data/parquet`. The rainfall data is needed to compute "rain 15 min ago" and the island-wide context — those features are functions of the station and time applied to the data.)
+The time must be an on-grid 5-minute SGT timestamp present in `data/parquet` (the data is needed to compute the lag and island-wide features).
 
-**Batch** — a demonstration that scores rows from a pre-built feature table (e.g. `data/train_table`) and prints their probabilities:
+**Batch** — scores a sample from a pre-built feature table and prints probabilities (illustration only; does not compute metrics):
 
 ```
 uv run python scripts/predict.py batch --input data/train_table
 ```
-
-This is for illustration, not metric reproduction: it prints predictions (and the true label if present) but does not compute PR-AUC/F1, and its random `--sample-frac` can separate the five threshold rows that belong to one station-time. The reported evaluation metrics come from `scripts/train.py`'s own test-set scoring, not from this command.
-
-Under the hood: the saved model is a Spark ML `PipelineModel` **directory** (StringIndexer + VectorAssembler + GBT), not a single `.pkl`, so loading needs Spark. Two steps `train.py` applies live *outside* the pipeline and `predict.py` reproduces them — filling missing features (`rain_t5/10/15/20`, `isl_std`) with the `-1` sentinel before `transform`, and forcing the exceedance probability to be non-increasing in the threshold afterwards (a running max over descending threshold per station-time). Single mode scores the five training thresholds plus the requested threshold, applies the adjustment, and returns the requested probability. In batch mode, consistency is enforced only among thresholds retained together for a station-time; sampling can leave an incomplete grid.
 
 ## Layout
 
@@ -112,7 +113,6 @@ scripts/tune.py                hyperparameter tuning harness
 scripts/predict.py             load the saved model and score rows
 src/spark_project/session.py   local SparkSession helper
 config.example.py              copy to config.py (gitignored) for GCP values
-archive/                       archived project notes and handoff documents
 ```
 
-`data/`, `config.py`, `.runtime/`, and `models/` are gitignored.
+`data/`, `config.py`, `.runtime/`, `models/`, and `archive/` are gitignored.
